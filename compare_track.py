@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare a solved portrait track to the fixture quads, and report motion.
+"""Compare a solved portrait track to the fixture quads, and check its motion.
 
 Usage:
   python compare_track.py [path/to/portrait.json]
@@ -10,13 +10,14 @@ Fixture check (exit code):
   more than the tolerance, or a fixture frame is missing. This is the
   check that catches a wrong-but-smooth track.
 
-Motion check (informational only):
-  Reports the worst frame-to-frame corner jump and flags jumps at or
-  above --jump-flag (default 5px). A lower max jump is not a pass and
-  does not affect the exit code. A smooth track can still be wrong.
+Motion check:
+  Measures every frame's corner acceleration (change in per-frame
+  movement, px/frame^2). A jump shows up as a spike. If expected.json
+  stores a motion baseline, this fails when the worst spike is more
+  than --jump-margin (default 1.0) above that baseline. A lower spike
+  than the baseline is not by itself proof the track is right; the
+  fixture check is what catches a wrong-but-smooth track.
 """
-from __future__ import annotations
-
 import argparse
 import json
 import math
@@ -24,7 +25,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-PLATE = "portrait"
 DEFAULT_TRACK = ROOT / "tracks" / "portrait.json"
 
 
@@ -38,11 +38,42 @@ def quads(track):
     return out
 
 
-def corner_err(a, b):
-    return max(math.hypot(p[0] - q[0], p[1] - q[1]) for p, q in zip(a, b))
+def jumps(got, key_from=0):
+    """(frame, px/frame^2) for every frame with a neighbour on each side.
+
+    The frame where the screen turns green is skipped: the solve changes
+    method there (bed flow -> keyed glass).
+    """
+    out = []
+    for i in range(1, len(got) - 1):
+        a, b, c = got[i - 1], got[i], got[i + 1]
+        if a is None or b is None or c is None or abs(i - key_from) <= 1:
+            continue
+        acc = max(
+            math.hypot(a[k][0] - 2 * b[k][0] + c[k][0], a[k][1] - 2 * b[k][1] + c[k][1])
+            for k in range(4)
+        )
+        out.append((i, acc))
+    return out
 
 
-def fixture_check(expected, got, tol):
+def main():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("track", nargs="?", default=str(DEFAULT_TRACK))
+    parser.add_argument("--tol", type=float, default=1.5)
+    parser.add_argument(
+        "--jump-margin",
+        type=float,
+        default=1.0,
+        help="allowed px/frame^2 above the stored motion baseline",
+    )
+    args = parser.parse_args()
+
+    expected = json.loads((ROOT / "fixtures" / "portrait" / "expected.json").read_text())
+    solved = json.loads(Path(args.track).read_text())
+    got = quads(solved)
     worst = 0.0
     failed = False
     print("== fixture check ==")
@@ -52,63 +83,32 @@ def fixture_check(expected, got, tol):
             print(f"f{i:04d}  MISSING")
             failed = True
             continue
-        err = corner_err(item["quad"], got[i])
+        err = 0.0
+        for a, b in zip(item["quad"], got[i]):
+            err = max(err, math.hypot(a[0] - b[0], a[1] - b[1]))
         worst = max(worst, err)
-        flag = "  FAIL" if err > tol else ""
+        flag = "  FAIL" if err > args.tol else ""
         print(f"f{i:04d}  {err:7.3f}px{flag}")
-        if err > tol:
+        if err > args.tol:
             failed = True
-    print(f"worst {worst:.3f}px  tol {tol}px  frames {len(expected['frames'])}")
-    return failed, worst
+    print(f"worst {worst:.3f}px  tol {args.tol}px  frames {len(expected['frames'])}")
 
-
-def motion_check(got, jump_flag):
-    print("== motion check (informational; does not affect exit code) ==")
-    worst = 0.0
-    pair = None
-    flagged = []
-    for i in range(1, len(got)):
-        a, b = got[i - 1], got[i]
-        if a is None or b is None:
-            continue
-        jump = corner_err(a, b)
-        if jump >= jump_flag:
-            flagged.append((jump, i - 1, i))
-        if jump > worst:
-            worst, pair = jump, (i - 1, i)
-    if pair is None:
-        print("no consecutive frames to compare")
-        return 0.0, None
-    t0, t1 = pair[0] / 24.0, pair[1] / 24.0
-    print(
-        f"max jump {worst:.3f}px  frames {pair[0]}->{pair[1]}  "
-        f"t={t0:.2f}-{t1:.2f}s  flagged>={jump_flag:g}px: {len(flagged)}"
-    )
-    flagged.sort(reverse=True)
-    show = flagged[:15] if flagged else []
-    for jump, a, b in show:
-        print(f"  {a:4d}->{b:4d}  {jump:7.3f}px  t={a/24:.2f}-{b/24:.2f}s")
-    if len(flagged) > 15:
-        print(f"  ... {len(flagged) - 15} more")
-    print(
-        "A lower max jump is not proof the track is right."
-    )
-    return worst, pair
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("track", nargs="?", default=str(DEFAULT_TRACK))
-    parser.add_argument("--tol", type=float, default=1.5)
-    parser.add_argument("--jump-flag", type=float, default=5.0)
-    args = parser.parse_args()
-
-    expected = json.loads((ROOT / "fixtures" / PLATE / "expected.json").read_text())
-    solved = json.loads(Path(args.track).read_text())
-    got = quads(solved)
-    failed, _ = fixture_check(expected, got, args.tol)
+    fps = solved.get("fps", expected.get("fps", 24.0))
+    js = sorted(jumps(got, solved.get("keyFrom", expected.get("keyFrom", 0))), key=lambda t: -t[1])
+    top = js[:5]
+    peak = top[0][1] if top else 0.0
+    spikes = ", ".join(f"f{i:04d} ({i / fps:.2f}s) {a:.1f}" for i, a in top)
     print()
-    motion_check(got, args.jump_flag)
+    print("== motion check ==")
+    print(f"worst corner acceleration {peak:.2f} px/frame^2  [{spikes}]")
+    if "motion" in expected:
+        limit = expected["motion"]["max_jump"] + args.jump_margin
+        if peak > limit:
+            print(f"motion FAIL: {peak:.2f} > baseline {expected['motion']['max_jump']} + {args.jump_margin}")
+            failed = True
+        else:
+            print(f"motion ok: baseline {expected['motion']['max_jump']} + {args.jump_margin}")
+        print("A lower spike than the baseline is not proof the track is right.")
     return 1 if failed else 0
 
 
